@@ -156,9 +156,12 @@ private:
     {
 #if defined(PLATFORM_ESP32)
         gpio_set_direction(static_cast<gpio_num_t>(SPORT_PIN), GPIO_MODE_INPUT);
-        gpio_matrix_in(static_cast<gpio_num_t>(SPORT_PIN), U0RXD_IN_IDX, false);
-        gpio_pullup_en(static_cast<gpio_num_t>(SPORT_PIN));
-        gpio_pulldown_dis(static_cast<gpio_num_t>(SPORT_PIN));
+        // Invert the incoming signal in the GPIO matrix so the UART peripheral
+        // sees standard logic levels (S.PORT idle = LOW on the wire → HIGH to UART).
+        gpio_matrix_in(static_cast<gpio_num_t>(SPORT_PIN), U0RXD_IN_IDX, true);
+        // Inverted UART idles LOW; pull the pin down to hold the idle state.
+        gpio_pulldown_en(static_cast<gpio_num_t>(SPORT_PIN));
+        gpio_pullup_dis(static_cast<gpio_num_t>(SPORT_PIN));
 #endif
         _transmitting = false;
     }
@@ -167,16 +170,18 @@ private:
     void setTxMode()
     {
 #if defined(PLATFORM_ESP32)
-        // Drive the pin HIGH (non-inverted UART idle state).
-        gpio_set_level(static_cast<gpio_num_t>(SPORT_PIN), 1);
+        // Drive the pin LOW (inverted UART idle state).
+        gpio_set_level(static_cast<gpio_num_t>(SPORT_PIN), 0);
         gpio_set_direction(static_cast<gpio_num_t>(SPORT_PIN),
                            GPIO_MODE_OUTPUT);
         // Detach the physical pin from the UART0 RX input by wiring the
-        // internal "constant HIGH" signal to the RX matrix slot instead.
+        // internal "constant HIGH" signal to the RX matrix slot instead,
+        // so the UART peripheral sees its idle (HIGH) level while we transmit.
         gpio_matrix_in(BRIDGE_MATRIX_CONST_HIGH, U0RXD_IN_IDX, false);
-        // Route UART0 TX output to the physical pin (non-inverted).
+        // Route UART0 TX output to the physical pin with inversion so that
+        // the standard UART idle (HIGH internally) appears as LOW on the wire.
         gpio_matrix_out(static_cast<gpio_num_t>(SPORT_PIN),
-                        U0TXD_OUT_IDX, false, false);
+                        U0TXD_OUT_IDX, true, false);
 #endif
         _transmitting = true;
     }
