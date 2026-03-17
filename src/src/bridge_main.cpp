@@ -260,6 +260,12 @@ public:
 // =====================================================================
 // Global instances
 // =====================================================================
+
+// crsfRouter is declared extern in CRSFRouter.h.  rx_main.cpp / tx_main.cpp
+// each provide their own definition, but those files are excluded from the
+// bridge build.  Define it here so the linker can resolve all references.
+CRSFRouter crsfRouter;
+
 static HandsetConnector handsetConnector;
 static FCConnector      fcConnector;
 static BridgeEndpoint   bridgeEndpoint;
