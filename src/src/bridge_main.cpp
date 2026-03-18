@@ -128,11 +128,31 @@ public:
         {
             _parser.processByte(this, static_cast<uint8_t>(Serial.read()));
         }
+
+        // Periodically send a mixer-sync packet so EdgeTX keeps its internal
+        // frame timer aligned with the rate at which RC frames arrive.
+        sendSyncPacket();
     }
 
     /** Send a CRSF frame to EdgeTX over the half-duplex line. */
     void forwardMessage(const crsf_header_t *message) override
     {
+        // Track RC channel frame timing so the sync packet carries an
+        // accurate rate field — EdgeTX uses this to pace its mixer.
+        if (message->type == CRSF_FRAMETYPE_RC_CHANNELS_PACKED)
+        {
+            const uint32_t nowUs = micros();
+            if (_lastRcFrameUs != 0)
+            {
+                const int32_t delta =
+                    static_cast<int32_t>(nowUs - _lastRcFrameUs);
+                // Only update when the interval is plausible (< SYNC_OUTLIER_MULT × current estimate).
+                if (delta > 0 && delta < _rcIntervalUs * SYNC_OUTLIER_MULT)
+                    _rcIntervalUs = (_rcIntervalUs * 7 + delta) / 8; // IIR
+            }
+            _lastRcFrameUs = nowUs;
+        }
+
         // Drop the frame if we are still in the middle of a previous
         // transmission to avoid corrupting the half-duplex bus.
         if (_transmitting) return;
@@ -150,6 +170,65 @@ public:
 private:
     CRSFParser _parser;
     bool       _transmitting = false;
+
+    /// OpenTX / EdgeTX mixer sync ///
+    // Interval between sync packets sent to the handset (ms).
+    static constexpr int32_t SYNC_INTERVAL_MS      = 200;
+    // Safety headroom reported to EdgeTX (100 µs, in 10ths-of-µs units).
+    static constexpr int32_t SYNC_SAFE_MARGIN       = 1000;
+    // Default RC frame interval before the first frame arrives (4 ms = 250 Hz).
+    static constexpr int32_t SYNC_DEFAULT_US        = 4000;
+    // Reject any RC frame interval larger than this multiple of the current
+    // estimate as an outlier (e.g. caused by a missed frame).
+    static constexpr int32_t SYNC_OUTLIER_MULT      = 5;
+
+    uint32_t _syncLastSentMs = 0;               // millis() when last sync packet was sent
+    int32_t  _rcIntervalUs   = SYNC_DEFAULT_US; // IIR-filtered µs between RC frames
+    uint32_t _lastRcFrameUs  = 0;               // micros() when last RC frame was forwarded
+
+    /** Build and send an OpenTX/EdgeTX mixer-sync packet (CRSF_FRAMETYPE_HANDSET).
+     *
+     *  EdgeTX uses these packets to keep its internal mixer timer aligned with
+     *  the rate at which it receives RC-channel frames from the bridge.  Without
+     *  them EdgeTX would lose sync and eventually stop refreshing channel data.
+     *
+     *  Called every SYNC_INTERVAL_MS when the transmit path is idle.
+     */
+    void sendSyncPacket()
+    {
+        const uint32_t now = millis();
+        if (now - _syncLastSentMs < static_cast<uint32_t>(SYNC_INTERVAL_MS))
+            return;
+
+        // packetRate is the RC frame interval expressed in 10ths of a µs,
+        // which is the unit expected by EdgeTX for the CRSF HANDSET timing frame.
+        const int32_t packetRate = _rcIntervalUs * 10;
+        // Tell EdgeTX to read the frame SYNC_SAFE_MARGIN (100 µs) early so
+        // there is always headroom and the channel data is never stale.
+        const int32_t offset = -SYNC_SAFE_MARGIN;
+
+        CRSF_MK_EXT_FRAME_T(crsf_sync_packet_t) syncPkt = {
+            .h = {
+                CRSF_ADDRESS_RADIO_TRANSMITTER,
+                CRSF_EXT_FRAME_SIZE(sizeof(crsf_sync_packet_t)),
+                CRSF_FRAMETYPE_HANDSET,
+                CRSF_ADDRESS_RADIO_TRANSMITTER,
+                CRSF_ADDRESS_CRSF_TRANSMITTER,
+            },
+            .p = {
+                .subType = CRSF_HANDSET_SUBCMD_TIMING,
+                .rate    = htobe32(static_cast<uint32_t>(packetRate)),
+                .offset  = htobe32(static_cast<uint32_t>(offset)),
+            },
+            .crc = crsfRouter.crsf_crc.calc(
+                reinterpret_cast<const uint8_t *>(&syncPkt) + CRSF_TELEMETRY_TYPE_INDEX,
+                sizeof(syncPkt) - 3)
+        };
+
+        crsfRouter.deliverMessageTo(CRSF_ADDRESS_RADIO_TRANSMITTER,
+                                    reinterpret_cast<const crsf_header_t *>(&syncPkt));
+        _syncLastSentMs = now;
+    }
 
     /** Switch the shared GPIO to receive (input) mode. */
     void setRxMode()
